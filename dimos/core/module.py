@@ -137,7 +137,6 @@ class ModuleBase(Configurable, CompositeResource):
                 module=self
             )
         )
-        self._loop, self._loop_thread = get_loop()
         try:
             self.rpc = self.config.rpc_transport(  # type: ignore[call-arg]
                 rpc_timeouts=self.config.rpc_timeouts,
@@ -239,7 +238,8 @@ class ModuleBase(Configurable, CompositeResource):
         # Reinitialize runtime attributes
         self._disposables = CompositeDisposable()
         self._async_thread = AsyncModuleThread(module=self)
-        self._loop, self._loop_thread = get_loop()
+        self._loop = None
+        self._loop_thread = None
         self._rpc = None
         self._tf = None
         self._main_gen = None
@@ -474,8 +474,10 @@ class ModuleBase(Configurable, CompositeResource):
                 f"{type(self).__name__}.main must be an `async def` with exactly "
                 "one `yield` (an async generator function)"
             )
+        if self._loop is None:
+            self._loop, self._loop_thread = get_loop()
         loop = self._loop
-        if loop is None or not loop.is_running():
+        if not loop.is_running():
             raise RuntimeError(f"{type(self).__name__}._loop is not running")
         gen = main_fn(self)
         try:
@@ -567,8 +569,10 @@ class ModuleBase(Configurable, CompositeResource):
             message is kept (LATEST policy).
           - The returned Disposable cancels the dispatcher task.
         """
+        if self._loop is None:
+            self._loop, self._loop_thread = get_loop()
         loop = self._loop
-        if loop is None or not loop.is_running():
+        if not loop.is_running():
             raise RuntimeError(f"{type(self).__name__}._loop is not running")
 
         async def _bootstrap() -> tuple[asyncio.Event, dict[str, Any], asyncio.Task[None]]:
