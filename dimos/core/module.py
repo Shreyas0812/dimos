@@ -11,12 +11,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Callable
+import asyncio
+from collections.abc import AsyncGenerator, Callable
 from dataclasses import dataclass
 from functools import partial
 import inspect
 import json
 import sys
+import threading
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -29,7 +31,7 @@ from typing import (
 )
 
 from pydantic import Field
-from reactivex.disposable import CompositeDisposable
+from reactivex.disposable import CompositeDisposable, Disposable
 
 from dimos.core.core import T, rpc
 from dimos.core.global_config import GlobalConfig, global_config
@@ -44,11 +46,17 @@ from dimos.protocol.service.spec import BaseConfig, Configurable
 from dimos.protocol.tf.tf import LCMTF, TFSpec
 from dimos.utils import colors
 from dimos.utils.generic import classproperty
+from dimos.utils.logging_config import setup_logger
 from dimos.utils.thread_utils import AsyncModuleThread, ThreadSafeVal
+
+logger = setup_logger()
 
 ModState = Literal["init", "started", "stopped"]
 
 if TYPE_CHECKING:
+    from reactivex import Observable
+    from reactivex.abc import DisposableBase
+
     from dimos.core.coordination.blueprints import Blueprint
     from dimos.core.introspection.module.info import ModuleInfo
     from dimos.core.rpc_client import RPCClient
@@ -64,6 +72,20 @@ class SkillInfo:
     class_name: str
     func_name: str
     args_schema: str
+
+
+def get_loop() -> tuple[asyncio.AbstractEventLoop, threading.Thread | None]:
+    try:
+        running_loop = asyncio.get_running_loop()
+        return running_loop, None
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        loop.set_task_factory(_logging_task_factory)
+
+        thr = threading.Thread(target=loop.run_forever, daemon=True)
+        thr.start()
+        return loop, thr
 
 
 Deployment = Literal["python", "docker"]
@@ -98,6 +120,10 @@ class ModuleBase(Configurable, CompositeResource):
     _async_thread: AsyncModuleThread
     _disposables: CompositeDisposable
     _bound_rpc_calls: dict[str, RpcCall] = {}
+    _loop: asyncio.AbstractEventLoop | None = None
+    _loop_thread: threading.Thread | None = None
+    _loop_thread_timeout: float = 2.0
+    _main_gen: AsyncGenerator[None, None] | None = None
     mod_state: ThreadSafeVal[ModState]
 
     rpc_calls: list[str] = []
@@ -111,6 +137,7 @@ class ModuleBase(Configurable, CompositeResource):
                 module=self
             )
         )
+        self._loop, self._loop_thread = get_loop()
         try:
             self.rpc = self.config.rpc_transport(  # type: ignore[call-arg]
                 rpc_timeouts=self.config.rpc_timeouts,
@@ -149,9 +176,12 @@ class ModuleBase(Configurable, CompositeResource):
                 raise RuntimeError(f"{type(self).__name__} cannot be restarted after stop")
             self.mod_state.set("started")
         self._async_thread.start()
+        self._start_main()
+        self._auto_bind_handlers()
 
     @rpc
     def stop(self) -> None:
+        self._stop_main()
         with self.mod_state as state:
             if state == "stopped":
                 return
@@ -161,9 +191,19 @@ class ModuleBase(Configurable, CompositeResource):
         if hasattr(self, "_disposables"):
             self._disposables.dispose()  # stops _async_thread via disposable
 
-        if self.rpc:
-            self.rpc.stop()  # type: ignore[attr-defined]
-            self.rpc = None  # type: ignore[assignment]
+        self._close_rpc()
+
+        # Save into local variables to avoid race when stopping concurrently
+        loop_thread = getattr(self, "_loop_thread", None)
+        loop = getattr(self, "_loop", None)
+
+        if loop_thread:
+            if loop_thread.is_alive():
+                if loop:
+                    loop.call_soon_threadsafe(loop.stop)
+                loop_thread.join(timeout=self._loop_thread_timeout)
+            self._loop = None
+            self._loop_thread = None
 
         if hasattr(self, "_tf") and self._tf is not None:
             self._tf.stop()
@@ -175,14 +215,22 @@ class ModuleBase(Configurable, CompositeResource):
             attr.stop()
             attr.owner = None
 
+    def _close_rpc(self) -> None:
+        if self.rpc:
+            self.rpc.stop()  # type: ignore[attr-defined]
+            self.rpc = None  # type: ignore[assignment]
+
     def __getstate__(self):  # type: ignore[no-untyped-def]
         """Exclude unpicklable runtime attributes when serializing."""
         state = self.__dict__.copy()
         # Remove unpicklable attributes
         state.pop("_disposables", None)
         state.pop("_async_thread", None)
+        state.pop("_loop", None)
+        state.pop("_loop_thread", None)
         state.pop("_rpc", None)
         state.pop("_tf", None)
+        state.pop("_main_gen", None)
         return state
 
     def __setstate__(self, state) -> None:  # type: ignore[no-untyped-def]
@@ -191,8 +239,10 @@ class ModuleBase(Configurable, CompositeResource):
         # Reinitialize runtime attributes
         self._disposables = CompositeDisposable()
         self._async_thread = AsyncModuleThread(module=self)
+        self._loop, self._loop_thread = get_loop()
         self._rpc = None
         self._tf = None
+        self._main_gen = None
 
     @property
     def tf(self):  # type: ignore[no-untyped-def]
@@ -375,6 +425,227 @@ class ModuleBase(Configurable, CompositeResource):
                 )
         return skills
 
+    def spawn(self, coro: Any) -> Any:
+        """
+        Schedule a coroutine on self._loop from any thread.
+
+        Use this instead of bare `asyncio.run_coroutine_threadsafe(coro,
+        self._loop)` when scheduling a long-running async task sync context like
+        start().
+
+        Unhandled exceptions are routed to the module logger instead of being
+        silently stored in the returned Future, which is the common pitfall when
+        nothing ever reads `.result()`.
+        """
+
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError(f"{type(self).__name__}._loop is not running")
+        future = asyncio.run_coroutine_threadsafe(coro, loop)
+        future.add_done_callback(self._log_async_handler_error)
+        return future
+
+    def process_observable(
+        self,
+        observable: "Observable[Any]",
+        async_cb: Callable[[Any], Any],
+    ) -> "DisposableBase":
+        """Subscribe `async_cb` (an async function) to `observable`, dispatching
+        each emitted value onto self._loop. Invocations are serialized through a
+        per-subscription dispatcher task with LATEST coalescing. The subscription
+        is registered for cleanup on stop()."""
+        if not inspect.iscoroutinefunction(async_cb):
+            raise TypeError("process_observable requires an `async def` callback")
+        on_msg, dispatcher_disp = self._make_async_dispatch(async_cb)
+        sub = observable.subscribe(on_msg)
+        return self.register_disposable(CompositeDisposable(sub, dispatcher_disp))
+
+    def _start_main(self) -> None:
+        """
+        If the subclass defines `async def main(self)` as an async generator
+        with exactly one `yield`, run everything before the `yield` as part of
+        start().
+        """
+        main_fn = getattr(type(self), "main", None)
+        if main_fn is None:
+            return
+        if not inspect.isasyncgenfunction(main_fn):
+            raise TypeError(
+                f"{type(self).__name__}.main must be an `async def` with exactly "
+                "one `yield` (an async generator function)"
+            )
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError(f"{type(self).__name__}._loop is not running")
+        gen = main_fn(self)
+        try:
+            asyncio.run_coroutine_threadsafe(gen.__anext__(), loop).result()
+        except StopAsyncIteration:
+            raise RuntimeError(
+                f"{type(self).__name__}.main must contain exactly one `yield` (found none)"
+            ) from None
+        except BaseException:
+            try:
+                asyncio.run_coroutine_threadsafe(gen.aclose(), loop).result()
+            except BaseException:
+                pass
+            raise
+        self._main_gen = gen
+
+    def _stop_main(self) -> None:
+        """Resume `main` past its yield so the teardown section runs."""
+        gen = self._main_gen
+        if gen is None:
+            return
+        self._main_gen = None
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(gen.__anext__(), loop).result()
+        except StopAsyncIteration:
+            return
+        except BaseException as e:
+            # Do not fail teardown if main raises. Log and continue with best
+            # effort to close the module.
+            logger.exception(
+                f"Error during {type(self).__name__}.main teardown: {type(e).__name__}: {e}"
+            )
+            return
+        # No StopAsyncIteration means main yielded a second time.
+        try:
+            asyncio.run_coroutine_threadsafe(gen.aclose(), loop).result()
+        except BaseException:
+            pass
+        logger.error(
+            f"{type(self).__name__}.main yielded more than once; "
+            "expected exactly one yield (setup, then teardown)"
+        )
+
+    def _auto_bind_handlers(self) -> None:
+        """
+        For each declared `x: In[T]`, if `async def handle_x` exists, subscribe it
+        via process_observable so it runs on self._loop.
+        """
+        # Validate every handler before subscribing any of them.
+        bindings: list[tuple[Any, Callable[[Any], Any]]] = []
+        for input_name, in_stream in self.inputs.items():
+            handler = getattr(self, f"handle_{input_name}", None)
+            if handler is None:
+                continue
+            # Async @rpc wraps the coroutine fn in a sync dispatcher. Unwrap it
+            # so we subscribe the raw coroutine fn instead of the wrapper (which
+            # would block on run_coroutine_threadsafe from the rx thread).
+            if hasattr(handler, "aio"):
+                handler = handler.aio.__get__(self, type(self))
+            if not inspect.iscoroutinefunction(handler):
+                raise TypeError(
+                    f"{type(self).__name__}.handle_{input_name} must be `async def` "
+                    "(use a manual self.<input>.subscribe(...) for sync handlers)"
+                )
+            bindings.append((in_stream, handler))
+
+        for in_stream, handler in bindings:
+            # process_observable runs each handler through a per-subscription
+            # dispatcher task on self._loop that serializes invocations and
+            # keeps only the latest unprocessed message. We subscribe to
+            # pure_observable() because the dispatcher already provides
+            # backpressure.
+            self.process_observable(in_stream.pure_observable(), handler)
+
+    def _make_async_dispatch(
+        self, async_handler: Callable[[Any], Any]
+    ) -> tuple[Callable[[Any], None], "DisposableBase"]:
+        """Build a sync callback that delivers `msg` into a single-slot LATEST
+        mailbox drained by a dedicated dispatcher task on `self._loop`.
+
+        Guarantees:
+          - The handler is invoked at most one-at-a-time (no interleaving across
+            awaits).
+          - If messages arrive faster than the handler can process them,
+            intermediate messages are dropped and only the most recent unprocessed
+            message is kept (LATEST policy).
+          - The returned Disposable cancels the dispatcher task.
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            raise RuntimeError(f"{type(self).__name__}._loop is not running")
+
+        async def _bootstrap() -> tuple[asyncio.Event, dict[str, Any], asyncio.Task[None]]:
+            event = asyncio.Event()
+            slot: dict[str, Any] = {"value": None, "has_value": False}
+
+            async def dispatcher() -> None:
+                try:
+                    while True:
+                        await event.wait()
+                        event.clear()
+                        if not slot["has_value"]:
+                            continue
+                        msg = slot["value"]
+                        slot["value"] = None
+                        slot["has_value"] = False
+                        try:
+                            await async_handler(msg)
+                        except asyncio.CancelledError:
+                            raise
+                        except BaseException as e:
+                            self._log_async_handler_exception(e)
+                except asyncio.CancelledError:
+                    return
+
+            return event, slot, asyncio.create_task(dispatcher())
+
+        event, slot, task = asyncio.run_coroutine_threadsafe(_bootstrap(), loop).result(timeout=5.0)
+
+        def on_msg(msg: Any) -> None:
+            loop_now = self._loop
+            if loop_now is None or not loop_now.is_running():
+                return
+
+            def _set() -> None:
+                slot["value"] = msg
+                slot["has_value"] = True
+                event.set()
+
+            loop_now.call_soon_threadsafe(_set)
+
+        disposed = False
+
+        def _dispose() -> None:
+            nonlocal disposed
+            if disposed:
+                return
+            disposed = True
+            loop_now = self._loop
+            if loop_now is not None and loop_now.is_running():
+                loop_now.call_soon_threadsafe(task.cancel)
+
+        return on_msg, Disposable(_dispose)
+
+    def _log_async_handler_exception(self, e: BaseException) -> None:
+        if isinstance(e, asyncio.CancelledError):
+            return  # task cancelled during shutdown
+        # A coroutine interacting with a stopped loop surfaces as
+        # RuntimeError ("Event loop is closed", "no running event loop",
+        # etc.). Only swallow that when the loop is actually gone.  Anything
+        # else (including RuntimeError raised by user code while the loop is
+        # healthy) is a real bug worth logging.
+        loop = self._loop
+        if isinstance(e, RuntimeError) and (loop is None or not loop.is_running()):
+            return
+        # Include exception type+message in the event string so it is
+        # visible on consoles whose formatters strip exc_info/traceback.
+        logger.exception(
+            f"Unhandled error in async task on {type(self).__name__}._loop: {type(e).__name__}: {e}"
+        )
+
+    def _log_async_handler_error(self, fut: Any) -> None:
+        try:
+            fut.result()
+        except BaseException as e:
+            self._log_async_handler_exception(e)
+
 
 class Module(ModuleBase):
     def __init_subclass__(cls, **kwargs: Any) -> None:
@@ -451,3 +722,33 @@ def is_module_type(value: Any) -> bool:
         return inspect.isclass(value) and issubclass(value, Module)
     except Exception:
         return False
+
+
+def _logging_task_factory(
+    loop: asyncio.AbstractEventLoop, coro: Any, **kwargs: Any
+) -> asyncio.Task[Any]:
+    """
+    Adds a done callback to log unhandled exceptions from any task created on
+    the loop.
+    """
+    task = asyncio.Task(coro, loop=loop, **kwargs)
+    task.add_done_callback(_log_task_exception)
+    return task
+
+
+def _log_task_exception(task: asyncio.Task[Any]) -> None:
+    if task.cancelled():
+        return
+    try:
+        exc = task.exception()
+    except asyncio.InvalidStateError:
+        return
+    if exc is None or isinstance(exc, (asyncio.CancelledError, StopAsyncIteration)):
+        return
+    # Calling task.exception() above marks the exception as retrieved, so
+    # asyncio's GC-time logger won't fire. We must log here.
+    name = task.get_name()
+    logger.error(
+        f"Unhandled exception in async task {name!r}: {type(exc).__name__}: {exc}",
+        exc_info=exc,
+    )
